@@ -17,7 +17,7 @@ clean:
 	rm -f ./$(PLUGIN_NAME).so
 
 install:
-	hyprpm disable monocle
+	hyprpm disable monocle || true
 	hyprctl plugin unload $(CURDIR)/$(PLUGIN_NAME).so
 	sleep 2
 	hyprctl plugin load $(CURDIR)/$(PLUGIN_NAME).so
