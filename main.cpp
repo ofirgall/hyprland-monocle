@@ -3,9 +3,11 @@
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 #include <hyprland/src/helpers/Monitor.hpp>
-#include <hyprland/src/managers/LayoutManager.hpp>
+#include <hyprland/src/layout/LayoutManager.hpp>
 #include <hyprland/src/render/decorations/CHyprGroupBarDecoration.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
+#include <hyprland/src/desktop/view/Group.hpp>
+#include <hyprland/src/helpers/math/Direction.hpp>
 #include <format>
 
 inline HANDLE PHANDLE = nullptr;
@@ -34,19 +36,19 @@ std::vector<PHLWINDOW> getWindowsOnWorkspace() {
 }
 
 void moveWindowIntoGroup(PHLWINDOW pWindow, PHLWINDOW pWindowInDirection) {
-    if (pWindow->m_groupData.deny)
+    if (pWindow->m_groupRules & Desktop::View::GROUP_DENY)
         return;
 
-    g_pLayoutManager->getCurrentLayout()->onWindowRemoved(pWindow); // This removes groupped property!
+    g_layoutManager->removeTarget(pWindow->layoutTarget());
 
     static auto USECURRPOS = CConfigValue<Hyprlang::INT>("group:insert_after_current");
-    pWindowInDirection     = *USECURRPOS ? pWindowInDirection : pWindowInDirection->getGroupTail();
+    pWindowInDirection     = *USECURRPOS ? pWindowInDirection : pWindowInDirection->m_group->tail();
 
-    pWindowInDirection->insertWindowToGroup(pWindow);
-    pWindowInDirection->setGroupCurrent(pWindow);
+    pWindowInDirection->m_group->add(pWindow);
+    pWindow->m_group->setCurrent(pWindow);
     pWindow->updateWindowDecos();
-    g_pLayoutManager->getCurrentLayout()->recalculateWindow(pWindow);
-    Desktop::focusState()->fullWindowFocus(pWindow);
+    g_layoutManager->recalculateMonitor(Desktop::focusState()->monitor());
+    Desktop::focusState()->fullWindowFocus(pWindow, Desktop::FOCUS_REASON_OTHER);
     g_pCompositor->warpCursorTo(pWindow->middle());
 
     if (!pWindow->getDecorationByType(DECORATION_GROUPBAR))
@@ -68,16 +70,15 @@ void moveIntoGroup(std::string args) {
 
     const auto PWINDOW = Desktop::focusState()->window();
 
-    if (!PWINDOW || PWINDOW->m_isFloating || PWINDOW->m_groupData.deny)
+    if (!PWINDOW || PWINDOW->m_isFloating || (PWINDOW->m_groupRules & Desktop::View::GROUP_DENY))
         return;
 
-    auto PWINDOWINDIR = g_pCompositor->getWindowInDirection(PWINDOW, arg);
+    auto PWINDOWINDIR = g_pCompositor->getWindowInDirection(PWINDOW, Math::fromChar(arg));
 
-    if (!PWINDOWINDIR || !PWINDOWINDIR->m_groupData.pNextWindow.lock())
+    if (!PWINDOWINDIR || !PWINDOWINDIR->m_group)
         return;
 
-    // Do not move window into locked group if binds:ignore_group_lock is false
-    if (!*PIGNOREGROUPLOCK && (PWINDOWINDIR->getGroupHead()->m_groupData.locked || (PWINDOW->m_groupData.pNextWindow.lock() && PWINDOW->getGroupHead()->m_groupData.locked)))
+    if (!*PIGNOREGROUPLOCK && (PWINDOWINDIR->m_group->locked() || (PWINDOW->m_group && PWINDOW->m_group->locked())))
         return;
 
     moveWindowIntoGroup(PWINDOW, PWINDOWINDIR);
@@ -93,17 +94,17 @@ SDispatchResult monocleOn(std::string arg) {
 
     std::vector<PHLWINDOW> windows = Monocle::getWindowsOnWorkspace();
     auto firstWindow = windows[0];
-    if (!firstWindow->m_groupData.pNextWindow.lock())
-        firstWindow->createGroup();
+    if (!firstWindow->m_group)
+        Desktop::View::CGroup::create({firstWindow});
 
     for (size_t i = 1; i < windows.size(); i++) {
         auto window1 = windows[i-1];
         auto window2 = windows[i];
-        Desktop::focusState()->fullWindowFocus(window2);
+        Desktop::focusState()->fullWindowFocus(window2, Desktop::FOCUS_REASON_OTHER);
         Monocle::moveWindowIntoGroup(window2, window1);
     }
 
-    Desktop::focusState()->fullWindowFocus(currentWindow);
+    Desktop::focusState()->fullWindowFocus(currentWindow, Desktop::FOCUS_REASON_OTHER);
     return {};
 }
 
@@ -117,7 +118,7 @@ SDispatchResult monocleOff(std::string arg) {
     if (toRemove != (size_t)-1)
         workspaces.erase(workspaces.begin() + toRemove);
 
-    if (Desktop::focusState()->window()->m_groupData.pNextWindow.lock())
+    if (Desktop::focusState()->window()->m_group)
         HyprlandAPI::invokeHyprctlCommand("dispatch", "togglegroup");
     return {};
 }
