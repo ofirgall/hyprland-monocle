@@ -39,8 +39,6 @@ void moveWindowIntoGroup(PHLWINDOW pWindow, PHLWINDOW pWindowInDirection) {
     if (pWindow->m_groupRules & Desktop::View::GROUP_DENY)
         return;
 
-    g_layoutManager->removeTarget(pWindow->layoutTarget());
-
     static auto USECURRPOS = CConfigValue<Hyprlang::INT>("group:insert_after_current");
     pWindowInDirection     = *USECURRPOS ? pWindowInDirection : pWindowInDirection->m_group->tail();
 
@@ -93,6 +91,9 @@ SDispatchResult monocleOn(std::string arg) {
     workspaces.push_back(currentWorkspace);
 
     std::vector<PHLWINDOW> windows = Monocle::getWindowsOnWorkspace();
+    if (windows.empty())
+        return {};
+
     auto firstWindow = windows[0];
     if (!firstWindow->m_group)
         Desktop::View::CGroup::create({firstWindow});
