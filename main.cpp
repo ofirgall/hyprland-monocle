@@ -8,11 +8,15 @@
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/view/Group.hpp>
 #include <hyprland/src/helpers/math/Direction.hpp>
+#include <hyprland/src/event/EventBus.hpp>
 #include <format>
+#include <set>
 
 inline HANDLE PHANDLE = nullptr;
 
-std::vector<int> workspaces;
+std::set<int>       activeWorkspaces;
+CHyprSignalListener windowCloseListener;
+CHyprSignalListener workspaceRemovedListener;
 
 namespace Monocle {
 
@@ -23,13 +27,23 @@ void log(Hyprutils::CLI::eLogLevel level, std::format_string<Args...> fmt, Args&
 }
 
 std::vector<PHLWINDOW> getWindowsOnWorkspace() {
-    std::vector<PHLWINDOW> windows = {};
+    auto mon = Desktop::focusState()->monitor();
+    if (!mon)
+        return {};
 
+    int  currentWorkspace = mon->activeWorkspaceID();
+
+    std::vector<PHLWINDOW> windows;
     for (auto& w : g_pCompositor->m_windows) {
-        int workspaceID = w->workspaceID();
-        int currentWorkspace = Desktop::focusState()->monitor()->activeWorkspaceID();
-        if (workspaceID == currentWorkspace)
-            windows.push_back(w);
+        if (w->workspaceID() != currentWorkspace)
+            continue;
+        if (!w->m_isMapped || w->m_fadingOut || w->m_readyToDelete || w->isHidden())
+            continue;
+        if (w->m_isFloating)
+            continue;
+        if (w->m_group)
+            continue;
+        windows.push_back(w);
     }
 
     return windows;
@@ -85,48 +99,57 @@ void moveIntoGroup(std::string args) {
 }
 
 SDispatchResult monocleOn(std::string arg) {
-    const auto currentWindow = Desktop::focusState()->window();
+    auto mon = Desktop::focusState()->monitor();
+    if (!mon)
+        return {};
 
-    int currentWorkspace = Desktop::focusState()->monitor()->activeWorkspaceID();
-    workspaces.push_back(currentWorkspace);
+    const auto currentWindow = Desktop::focusState()->window();
+    int        currentWorkspace = mon->activeWorkspaceID();
 
     std::vector<PHLWINDOW> windows = Monocle::getWindowsOnWorkspace();
-    if (windows.empty())
+    if (windows.size() < 2)
         return {};
+
+    activeWorkspaces.insert(currentWorkspace);
 
     auto firstWindow = windows[0];
     if (!firstWindow->m_group)
         Desktop::View::CGroup::create({firstWindow});
 
     for (size_t i = 1; i < windows.size(); i++) {
-        auto window1 = windows[i-1];
+        auto window1 = windows[i - 1];
         auto window2 = windows[i];
         Desktop::focusState()->fullWindowFocus(window2, Desktop::FOCUS_REASON_OTHER);
         Monocle::moveWindowIntoGroup(window2, window1);
     }
 
-    Desktop::focusState()->fullWindowFocus(currentWindow, Desktop::FOCUS_REASON_OTHER);
+    if (currentWindow && !currentWindow->m_fadingOut)
+        Desktop::focusState()->fullWindowFocus(currentWindow, Desktop::FOCUS_REASON_OTHER);
     return {};
 }
 
 SDispatchResult monocleOff(std::string arg) {
-    int currentWorkspace = Desktop::focusState()->monitor()->activeWorkspaceID();
-    size_t toRemove = -1;
-    for (size_t i = 0; i < workspaces.size(); i++) {
-        if (workspaces[i] == currentWorkspace)
-            toRemove = i;
-    }
-    if (toRemove != (size_t)-1)
-        workspaces.erase(workspaces.begin() + toRemove);
+    auto mon = Desktop::focusState()->monitor();
+    if (!mon)
+        return {};
 
-    if (Desktop::focusState()->window()->m_group)
-        HyprlandAPI::invokeHyprctlCommand("dispatch", "togglegroup");
+    int currentWorkspace = mon->activeWorkspaceID();
+    activeWorkspaces.erase(currentWorkspace);
+
+    const auto w = Desktop::focusState()->window();
+    if (w && w->m_group)
+        w->m_group->destroy();
+
     return {};
 }
 
 SDispatchResult monocleToggle(std::string arg) {
-    int currentWorkspace = Desktop::focusState()->monitor()->activeWorkspaceID();
-    if (std::find(workspaces.begin(), workspaces.end(), currentWorkspace) != workspaces.end())
+    auto mon = Desktop::focusState()->monitor();
+    if (!mon)
+        return {};
+
+    int currentWorkspace = mon->activeWorkspaceID();
+    if (activeWorkspaces.count(currentWorkspace))
         return monocleOff("");
     else
         return monocleOn("");
@@ -142,8 +165,6 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     const std::string HASH = __hyprland_api_get_hash();
 
-    // ALWAYS add this to your plugins. It will prevent random crashes coming from
-    // mismatched header versions.
     const std::string CLIENT_HASH = __hyprland_api_get_client_hash();
     if (HASH != CLIENT_HASH) {
         throw std::runtime_error("[Monocle] Version mismatch: server=" + HASH + " client=" + CLIENT_HASH);
@@ -153,9 +174,28 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addDispatcherV2(PHANDLE, "monocle:off", monocleOff);
     HyprlandAPI::addDispatcherV2(PHANDLE, "monocle:toggle", monocleToggle);
 
-    return {"MyPlugin", "An amazing plugin that is going to change the world!", "Me", "1.0"};
+    windowCloseListener = Event::bus()->m_events.window.close.listen([](PHLWINDOW w) {
+        if (!w || !w->m_workspace)
+            return;
+        int wsid = w->workspaceID();
+        if (!activeWorkspaces.count(wsid))
+            return;
+        // If the group this window belongs to is about to have <= 1 member,
+        // Hyprland will dissolve it. Track that by clearing our state.
+        if (w->m_group && w->m_group->size() <= 2)
+            activeWorkspaces.erase(wsid);
+    });
+
+    workspaceRemovedListener = Event::bus()->m_events.workspace.removed.listen([](PHLWORKSPACEREF ws) {
+        if (auto locked = ws.lock())
+            activeWorkspaces.erase(locked->m_id);
+    });
+
+    return {"Monocle", "Groups all tiled windows on a workspace into a single tab group", "ofirgall", "1.1"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    // ...
+    windowCloseListener.reset();
+    workspaceRemovedListener.reset();
+    activeWorkspaces.clear();
 }
